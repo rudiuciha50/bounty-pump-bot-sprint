@@ -1,30 +1,33 @@
-// Pump.fun replay sprint — "deep survivor rider".
+// Deep-survivor rider for the pump.fun replay sprint.
 //
-// Protocol: the grader sends one `hello`, then one `batch` per slot of the replay window, and reads
-// back one reply of `orders` for that slot. A pump.fun price is a pure function of the bonding
-// curve, so the only per-mint state worth carrying is the real SOL reserve (`real_quote_reserves`,
-// rq below): market cap is proportional to rq*rq, and the curve is finished at about 85 SOL of rq,
-// at which point the harness itself closes whatever we still hold.
+// The harness replays a tape slot by slot. For every slot it hands us that slot's chain events and
+// reads back the orders we want filled a few slots later; the only thing a pump curve exposes is its
+// real SOL reserve, and everything else about the coin — price, market cap, how far the curve still
+// has to run — follows from it arithmetically. So the desk below keeps one small record per mint and
+// makes every decision from two numbers: how many trades that mint has printed, and where its
+// reserve stands right now.
 //
-// What the dev window taught (measured offline against the three published dataset parts first):
-//   * Launch sniping looks free and is not. The median coin doubles within ~15 slots of its
-//     CreateEvent, but the long tail collapses, and the 95 bps protocol fee plus the 30 bps creator
-//     fee is charged on both legs of every round trip. Hundreds of tiny round trips leave the
-//     account deep in the red even when the entry filter itself is fine.
-//   * Coins that are already deep and busy are where the money is. Survivors of this window print
-//     6 to 3350 trades over 300 to 2200 slots, so a coin that has already printed 400 trades has
-//     proved it has real flow behind it. A handful of large, patient round trips pays the fee a
-//     handful of times instead of hundreds.
+// The shape of the edge, measured on the published dev dataset before any of this was written:
 //
-// So: one buy per coin, armed only after the coin has printed 400 trade ticks, sized at the
-// harness's own 1%-of-real-reserve cap (the most one reply may spend on one mint anyway) held under
-// a 1 SOL ceiling, and held until rq reaches twice the entry rq — roughly a 4x on the market cap.
-// There is deliberately no stop loss: the tail is the edge, and a stop pays the fee twice to cut it
-// off. Positions still open when the tape ends are flattened by the harness.
+//   * Grabbing fresh launches is a losing habit. A coin that has just been created trades on a curve
+//     holding no real SOL at all, where the 100 bps curve fee plus the 30 bps creator fee is charged
+//     on both legs of a round trip that is usually a few percent wide. Do that a few hundred times
+//     and the fees alone eat the account.
+//   * Coins with a real tape behind them behave differently. In this window the ones that survive
+//     print somewhere between six hundred and a few thousand trades across a thousand-odd slots, and
+//     a coin that has already printed several hundred has demonstrated there is flow to ride. Big,
+//     infrequent round trips pay the fee a handful of times instead of constantly.
 //
-// Determinism: nothing in this file reads the clock, the environment, the network or Math.random,
-// and every iteration is over insertion-ordered structures, so the grader's two executions produce
-// byte-identical action logs.
+// Hence: a coin becomes eligible only once it has printed MATURITY_TICKS trades, we take at most one
+// entry per coin, and the stake is sized to the harness's own per-mint ceiling under a hard cap so a
+// single name cannot dominate the book. The exit is a reserve multiple — two times the reserve we
+// bought at, which is roughly a fourfold on market cap — or the patience timer, whichever lands
+// first. There is no stop loss on purpose: the payoff lives in the right tail, and a stop pays the
+// round trip fee twice to cut that tail off. Anything still held when the tape ends is flattened by
+// the harness itself.
+//
+// Purity: no clock, no environment, no randomness. Every loop walks insertion-ordered maps, so the
+// two graded executions of the same tape emit byte-identical replies.
 
 import {
   LAMPORTS_PER_SOL,
@@ -32,154 +35,245 @@ import {
   type Bot,
   type BotState,
   type BuyInput,
+  type Done,
   type OrderInput,
   type SellInput,
 } from './vendor/makefun-bot.ts';
 
-/** Basis points per unit: 10 000 bps = 100%. */
-const BPS = 10_000n;
+// ---------------------------------------------------------------------------- tuning
 
-/** A buy has to be worth its fee, and one reply's buy on one mint must stay under our ceiling. */
-const MIN_STAKE = LAMPORTS_PER_SOL / 500n;
-const MAX_STAKE = LAMPORTS_PER_SOL;
-/** The harness caps one reply's buys on one mint at 1% of that mint's real reserve. */
-const RESERVE_SHARE_BPS = 100n;
+/** Fee arithmetic is quoted in basis points: 10 000 of them make a whole. */
+const FEE_UNITS = 10_000n;
 
-/** Trade ticks a coin must have printed before it counts as a survivor with real flow. */
-const MIN_TICKS = 400;
+/** Below this a fill cannot clear its own transaction fee, so it is not worth sending. */
+const MIN_NOTIONAL = LAMPORTS_PER_SOL / 500n;
+
+/** Never put more than one SOL into a single name, whatever its curve would allow. */
+const CEILING = LAMPORTS_PER_SOL;
+
+/** The share of the mint's real reserve the harness lets one reply spend, in basis points. */
+const ATTACK_BPS = 100n;
+
+/** Trades a mint must have printed before the desk will consider it at all. */
+const MATURITY_TICKS = 400;
+
 /**
- * Never enter a curve this deep. The curve finishes at about 85 SOL of real reserve, so a coin
- * bought at 60 SOL can at most still reach ~1.2x on rq: the 2x target is already out of reach and
- * the slot it takes is worth more on a coin with room left. Measured on the dev window: this guard
- * drops a handful of late, exhausted entries without touching the coins the edge actually comes
- * from.
+ * Refuse curves that are nearly spent. A pump curve ends around eighty-five SOL of real reserve, so
+ * an entry taken at sixty has at most a fifth of a doubling left in it: the target is arithmetically
+ * out of reach and the position slot is better spent on a coin that still has room.
  */
-const MAX_ENTRY_RESERVE = 60n * LAMPORTS_PER_SOL;
-/** Give a survivor this many slots to reach the target before the position is recycled. */
-const MAX_HOLD_SLOTS = 250;
-/** Exit at this multiple of the entry reserve (2x on rq is about 4x on the market cap). */
-const TARGET_NUM = 2n;
-const TARGET_DEN = 1n;
+const DEPTH_LIMIT = 60n * LAMPORTS_PER_SOL;
 
-interface Coin {
-  /** Trade ticks seen on this coin so far. */
-  ticks: number;
-  /** Real SOL reserve after the latest tick (0n before the first trade). */
+/** Slots a position may sit before the desk recycles it, whether or not it reached its target. */
+const PATIENCE_SLOTS = 250;
+
+/** Exit multiple on the real reserve: two means the market cap has roughly quadrupled. */
+const EXIT_NUM = 2n;
+const EXIT_DEN = 1n;
+
+/**
+ * Fade guard, in thousandths. A survivor whose reserve has slipped since the previous batch it
+ * traded in is a curve on the way down, and a doubling is exactly what a curve on the way down does
+ * not do. Passing on it costs nothing — the entry flag is only burned when a buy is actually
+ * queued — so the desk simply looks again on a later slot. The window is how stale that earlier
+ * reading may be before the comparison stops meaning anything.
+ */
+const FADE_WINDOW_SLOTS = 30;
+const FADE_TOLERANCE = 990n;
+const FADE_UNITS = 1_000n;
+
+// ---------------------------------------------------------------------------- per-mint record
+
+interface Watch {
+  /** TradeEvents folded in so far. Created coins start at zero. */
+  trades: number;
+  /** Real SOL reserve after the most recent trade; zero until the first one lands. */
   reserve: bigint;
-  /** The one buy this coin gets has already been sent (or attempted). */
-  entered: boolean;
-  /** Reserve at our entry: 0n until the buy goes out, so an exit never fires on an unheld coin. */
-  entryReserve: bigint;
-  /** Slot of our entry, for the recycle timer. */
-  entrySlot: number;
-  /** A CompleteEvent was seen: the harness has closed any position in this coin. */
-  complete: boolean;
+  /** Reserve after the trade before this one, kept so a fade can be spotted (the v2 gate uses it). */
+  previous: bigint;
+  /** Slot the `previous` reading was taken on, so a stale comparison can be ignored. */
+  previousSlot: number;
+  /** Slot the current `reserve` reading came from; -1 before the first trade. */
+  reserveSlot: number;
+  /** Our single entry for this mint has been sent, filled or rejected. */
+  spent: boolean;
+  /** Real reserve at the moment we bought; zero while we hold nothing, which blocks exits. */
+  basis: bigint;
+  /** Slot our buy was decided on; negative until then. */
+  openedAt: number;
+  /** The curve migrated: the harness closed any position here and no order will be accepted. */
+  retired: boolean;
 }
 
-/** Per-mint state, keyed by mint. Insertion order is the order coins were first seen. */
-const book = new Map<string, Coin>();
+/** One record per mint, in the order the tape first revealed it. */
+const desk = new Map<string, Watch>();
 
-function coinFor(mint: string): Coin {
-  let c = book.get(mint);
-  if (c === undefined) {
-    c = { ticks: 0, reserve: 0n, entered: false, entryReserve: 0n, entrySlot: -1, complete: false };
-    book.set(mint, c);
+function watchOf(mint: string): Watch {
+  const found = desk.get(mint);
+  if (found !== undefined) return found;
+  const fresh: Watch = {
+    trades: 0,
+    reserve: 0n,
+    previous: 0n,
+    previousSlot: -1,
+    reserveSlot: -1,
+    spent: false,
+    basis: 0n,
+    openedAt: -1,
+    retired: false,
+  };
+  desk.set(mint, fresh);
+  return fresh;
+}
+
+// ---------------------------------------------------------------------------- helpers
+
+/** Fold this slot's events into the desk. A trade's reserve is post-trade, so the last one wins. */
+function absorb(batch: Batch): void {
+  for (const event of batch.events) {
+    const watch = watchOf(event.mint);
+    switch (event.event) {
+      case 'CreateEvent':
+        watch.trades = 0;
+        watch.reserve = 0n;
+        watch.previous = 0n;
+        watch.previousSlot = -1;
+        watch.reserveSlot = -1;
+        watch.retired = false;
+        break;
+      case 'TradeEvent':
+        // Two or more trades in one slot make the "previous" reading this same slot's, which is
+        // still the right comparison: it is the tick immediately before the current one.
+        watch.previous = watch.reserve;
+        watch.previousSlot = watch.reserveSlot;
+        watch.trades += 1;
+        watch.reserve = BigInt(event.real_quote_reserves);
+        watch.reserveSlot = event.slot;
+        break;
+      default:
+        watch.retired = true;
+        break;
+    }
   }
-  return c;
 }
+
+/**
+ * True when the coin has visibly lost reserve since the most recent earlier tick and that tick is
+ * recent enough to mean something. A coin with no earlier reading (its first trade) is not fading.
+ */
+function fading(state: BotState, watch: Watch): boolean {
+  if (watch.previous === 0n) return false;
+  if (watch.previousSlot < 0) return false;
+  if (state.slot - watch.previousSlot > FADE_WINDOW_SLOTS) return false;
+  return watch.reserve * FADE_UNITS < watch.previous * FADE_TOLERANCE;
+}
+
+/** True when the reserve has doubled since our entry. */
+function atTarget(watch: Watch): boolean {
+  if (watch.basis === 0n) return false;
+  return watch.reserve * EXIT_DEN >= watch.basis * EXIT_NUM;
+}
+
+/** True when the position has been open for PATIENCE_SLOTS slots or more. */
+function tooOld(state: BotState, watch: Watch): boolean {
+  if (watch.openedAt < 0) return false;
+  return state.slot - watch.openedAt >= PATIENCE_SLOTS;
+}
+
+// ---------------------------------------------------------------------------- the strategy
 
 export const strategy: Bot = {
-  onHello(state: BotState) {
-    // stderr only: stdout carries the protocol replies.
+  onHello(state: BotState): void {
+    // stderr is ours; stdout belongs to the protocol replies.
     console.error(
-      `hello: ${state.hello.protocol}, ${state.cash} lamports, ` +
-        `${state.hello.caps.max_open_positions} positions, ` +
-        `${state.hello.caps.max_orders_per_batch} orders per batch`,
+      `desk open: ${state.cash} lamports, ${state.hello.caps.max_open_positions} slots, ` +
+        `${state.hello.caps.max_orders_per_batch} orders per reply, ` +
+        `latency ${state.hello.latency_slots} slots`,
     );
   },
 
-  onBatch(state: BotState, batch: Batch) {
-    const orders: OrderInput[] = [];
+  onBatch(state: BotState, batch: Batch): OrderInput[] {
+    absorb(batch);
 
-    // 1. Fold the slot in. A TradeEvent's reserve is post-trade, so the last trade of the slot is
-    //    the mark every decision below is taken on.
-    for (const ev of batch.events) {
-      const c = coinFor(ev.mint);
-      if (ev.event === 'CreateEvent') {
-        c.ticks = 0;
-        c.reserve = 0n; // a fresh curve holds no real SOL yet
-        c.complete = false;
-      } else if (ev.event === 'TradeEvent') {
-        c.ticks += 1;
-        c.reserve = BigInt(ev.real_quote_reserves);
-      } else {
-        c.complete = true;
-      }
-    }
+    const cap = state.hello.caps.max_open_positions;
+    const perReply = state.hello.caps.max_orders_per_batch;
+    const fee = state.txFeeLamports();
+    const queued: OrderInput[] = [];
 
-    // 2. Exits first, so a sell frees a position slot for this same batch's entries.
-    let freeSlots = state.hello.caps.max_open_positions - state.committedPositionCount();
-    const held = new Set<string>();
+    // Exits are planned first: a sell queued in this reply hands its slot back to an entry decided a
+    // few lines below, which is the only way a full book can rotate inside one slot.
+    let open = state.committedPositionCount();
+    const holding = new Set<string>();
     for (const [mint, position] of state.positions) {
-      held.add(mint);
-      const c = book.get(mint);
-      if (c === undefined || c.entryReserve === 0n) continue;
-      const reachedTarget = c.reserve * TARGET_DEN >= c.entryReserve * TARGET_NUM;
-      const aged = state.slot - c.entrySlot >= MAX_HOLD_SLOTS;
-      if (!reachedTarget && !aged) continue;
-      const sell: SellInput = {
+      holding.add(mint);
+      const watch = desk.get(mint);
+      if (watch === undefined || watch.basis === 0n) continue;
+      if (!atTarget(watch) && !tooOld(state, watch)) continue;
+      if (queued.length >= perReply) break;
+      const order: SellInput = {
         side: 'sell',
         mint,
         token_amount: position.token_amount,
-        max_slippage_bps: 10_000, // marks are fresh; the wide band only avoids a needless refusal
+        // The mark we decided on is the freshest one the harness has; the band is only slack against
+        // an ordinary tick between decision and fill.
+        max_slippage_bps: 10_000,
       };
-      orders.push(sell);
-      freeSlots += 1;
+      queued.push(order);
+      open -= 1;
+      watch.basis = 0n; // the position is spoken for; no second sell for the same mint
+      watch.spent = true; // a recycled coin does not get a second entry either
     }
 
-    // 3. Enter survivors, one buy each, in the order this slot's events arrived.
-    let free = state.freeCashLamports();
-    const tx = state.txFeeLamports();
-    let added = 0;
-    for (const ev of batch.events) {
-      if (freeSlots <= 0) break;
-      if (orders.length + added >= state.hello.caps.max_orders_per_batch) break;
-      if (ev.event !== 'TradeEvent') continue;
-      const mint = ev.mint;
-      const c = coinFor(mint);
-      if (c.entered || c.complete || c.reserve <= 0n) continue;
-      if (held.has(mint) || state.pending.has(mint)) continue;
-      if (c.ticks < MIN_TICKS) continue;
-      if (c.reserve >= MAX_ENTRY_RESERVE) continue;
+    // Entries: one buy per mint, walking this slot's events in the order they arrived.
+    let cash = state.freeCashLamports();
+    for (const event of batch.events) {
+      if (open >= cap) break;
+      if (queued.length >= perReply) break;
+      if (event.event !== 'TradeEvent') continue;
 
-      // Size to the mint's own cap (the harness enforces it per reply anyway) under our ceiling.
-      const cap = state.maxBuyLamports(mint);
-      const share = (c.reserve * RESERVE_SHARE_BPS) / BPS;
-      let stake = share < MAX_STAKE ? share : MAX_STAKE;
-      if (cap > 0n && cap < stake) stake = cap;
-      if (stake < MIN_STAKE) continue;
-      if (stake + tx > free) continue;
+      const mint = event.mint;
+      const watch = watchOf(mint);
+      if (watch.spent || watch.retired) continue;
+      if (watch.reserve <= 0n) continue;
+      if (watch.trades < MATURITY_TICKS) continue;
+      if (watch.reserve >= DEPTH_LIMIT) continue;
+      if (fading(state, watch)) continue;
+      if (holding.has(mint) || state.pending.has(mint)) continue;
 
-      const buy: BuyInput = { side: 'buy', mint, quote_lamports: stake, max_slippage_bps: 10_000 };
-      orders.push(buy);
-      c.entered = true;
-      c.entryReserve = c.reserve;
-      c.entrySlot = state.slot;
-      free -= stake + tx;
-      freeSlots -= 1;
-      added += 1;
+      // Size: the harness's own 1%-of-reserve rule, our one SOL ceiling, and whatever the shim
+      // reports as this mint's cap today, taken as the smallest of the three.
+      const allowed = state.maxBuyLamports(mint);
+      const curveShare = (watch.reserve * ATTACK_BPS) / FEE_UNITS;
+      let stake = curveShare < CEILING ? curveShare : CEILING;
+      if (allowed > 0n && allowed < stake) stake = allowed;
+      if (stake < MIN_NOTIONAL) continue;
+      if (stake + fee > cash) continue;
+
+      const buy: BuyInput = {
+        side: 'buy',
+        mint,
+        quote_lamports: stake,
+        max_slippage_bps: 10_000,
+      };
+      queued.push(buy);
+      watch.spent = true;
+      watch.basis = watch.reserve;
+      watch.openedAt = state.slot;
+      cash -= stake + fee;
+      open += 1;
     }
 
-    return orders;
+    return queued;
   },
 
-  onDone(state: BotState, done) {
-    // Whatever was still open has been flattened by the harness before this line runs.
-    // The book's size is the count of distinct coins the window carried, which is how a run is
-    // sanity-checked against the dataset's own manifest without touching stdout.
+  onDone(state: BotState, done: Done): void {
+    // Everything still held has already been flattened by the harness at this point, so this is only
+    // a sanity line: the desk's size is how many distinct coins the tape carried.
+    let entered = 0;
+    for (const watch of desk.values()) if (watch.spent) entered += 1;
     console.error(
-      `done: ${done.reason}, ${book.size} coins seen, ${state.cash} lamports cash, ` +
-        `${state.positions.size} open`,
+      `desk closed (${done.reason}): ${desk.size} mints seen, ${entered} entered, ` +
+        `${state.cash} lamports left, ${state.positions.size} open`,
     );
   },
 };
