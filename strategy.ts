@@ -47,6 +47,14 @@ const RESERVE_SHARE_BPS = 100n;
 
 /** Trade ticks a coin must have printed before it counts as a survivor with real flow. */
 const MIN_TICKS = 400;
+/**
+ * Never enter a curve this deep. The curve finishes at about 85 SOL of real reserve, so a coin
+ * bought at 60 SOL can at most still reach ~1.2x on rq: the 2x target is already out of reach and
+ * the slot it takes is worth more on a coin with room left. Measured on the dev window: this guard
+ * drops a handful of late, exhausted entries without touching the coins the edge actually comes
+ * from.
+ */
+const MAX_ENTRY_RESERVE = 60n * LAMPORTS_PER_SOL;
 /** Give a survivor this many slots to reach the target before the position is recycled. */
 const MAX_HOLD_SLOTS = 250;
 /** Exit at this multiple of the entry reserve (2x on rq is about 4x on the market cap). */
@@ -142,6 +150,7 @@ export const strategy: Bot = {
       if (c.entered || c.complete || c.reserve <= 0n) continue;
       if (held.has(mint) || state.pending.has(mint)) continue;
       if (c.ticks < MIN_TICKS) continue;
+      if (c.reserve >= MAX_ENTRY_RESERVE) continue;
 
       // Size to the mint's own cap (the harness enforces it per reply anyway) under our ceiling.
       const cap = state.maxBuyLamports(mint);
